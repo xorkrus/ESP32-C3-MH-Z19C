@@ -89,8 +89,8 @@ const unsigned long TEMP_POS_INTERVAL = 5000; // менять позицию к�
 
 // ========== НАСТРОЙКИ ==========
 struct Config {
-  char ssid[32] = "xopkland";
-  char password[64] = "1234567890987654321";
+  char ssid[32] = "SSID";
+  char password[64] = "PASS";
   char mqtt_server[40] = "192.168.1.42";
   int mqtt_port = 1883;
   char mqtt_user[32] = "";
