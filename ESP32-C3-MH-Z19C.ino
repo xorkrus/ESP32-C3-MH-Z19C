@@ -328,7 +328,7 @@ void updateDisplayContent() {
     display.setTextSize(3);
   }
 
-  // Отображаем цифры с плавающим смещением, но корректируем, чтобы не выходили за экран
+  // Отображаем цифры с плавающим смещением, корректируем выход за границы
   int textWidth = 0;
   char ppmStr[6];
   sprintf(ppmStr, "%d", currentPpm);
@@ -344,11 +344,11 @@ void updateDisplayContent() {
   int x = (SCREEN_WIDTH / 2) - (textWidth / 2) + numberOffsetX;
   int y = (SCREEN_HEIGHT / 2) - 12 + numberOffsetY; // центрируем
 
-  // Коррекция, чтобы не выходило за границы
+  // Коррекция
   if (x < 0) x = 0;
   if (x + textWidth > SCREEN_WIDTH) x = SCREEN_WIDTH - textWidth;
   if (y < 0) y = 0;
-  if (y + 24 > SCREEN_HEIGHT) y = SCREEN_HEIGHT - 24; // 24 - примерная высота
+  if (y + 24 > SCREEN_HEIGHT) y = SCREEN_HEIGHT - 24;
 
   display.setTextColor(SSD1306_WHITE);
   if (currentPpm < 0) {
@@ -371,7 +371,6 @@ void updateDisplayContent() {
     dtostrf(currentTemp, 4, 1, tempStr);
     strcat(tempStr, " C");
 
-    // Определяем позицию
     int tx, ty;
     switch (tempPosition) {
       case 0: // справа снизу
@@ -495,8 +494,9 @@ void sendMqtt() {
   }
 }
 
-// ========== WEB-СЕРВЕР (красивый, адаптивный) ==========
-const char* htmlHeader = R"rawliteral(
+// ========== WEB-СЕРВЕР ==========
+void handleRoot() {
+  String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -643,38 +643,6 @@ const char* htmlHeader = R"rawliteral(
     <form method="POST" action="/save">
 )rawliteral";
 
-const char* htmlFooter = R"rawliteral(
-        <div class="section">
-            <div class="pin-group">
-                <div class="form-group">
-                    <label>ПИН-код для сохранения:</label>
-                    <input type="password" name="pin" placeholder="0000" required>
-                </div>
-            </div>
-            <button type="submit" class="btn">Сохранить и перезагрузить</button>
-            <div class="error" id="pinError" style="display:none;">Неверный PIN-код</div>
-        </div>
-    </form>
-    <div class="footer">
-        <a href="https://github.com/xorkrus/ESP32-C3-MH-Z19C" target="_blank">Исходный код на GitHub</a>
-    </div>
-</div>
-<script>
-    // Простая проверка PIN на клиенте (сервер всё равно проверит)
-    document.querySelector('form').addEventListener('submit', function(e) {
-        var pin = document.querySelector('input[name="pin"]').value;
-        if (pin !== "0000") { // предварительная проверка, но серверная проверка важнее
-            e.preventDefault();
-            document.getElementById('pinError').style.display = 'block';
-        }
-    });
-</script>
-</body>
-</html>
-)rawliteral";
-
-void handleRoot() {
-  String html = htmlHeader;
   // Wi-Fi
   html += "<div class='section'><h2>Wi-Fi</h2>";
   html += "<div class='form-group'><label>SSID:</label><input name='ssid' value='" + String(config.ssid) + "'></div>";
@@ -723,7 +691,36 @@ void handleRoot() {
   html += "<div class='section'><h2>Дисплей</h2>";
   html += "<div class='form-group'><label>Использовать жирный шрифт:</label><input type='checkbox' name='use_custom_font' " + String(config.use_custom_font ? "checked" : "") + "></div></div>";
 
-  html += htmlFooter;
+  // Footer
+  html += R"rawliteral(
+        <div class="section">
+            <div class="pin-group">
+                <div class="form-group">
+                    <label>ПИН-код для сохранения:</label>
+                    <input type="password" name="pin" placeholder="0000" required>
+                </div>
+            </div>
+            <button type="submit" class="btn">Сохранить и перезагрузить</button>
+            <div class="error" id="pinError" style="display:none;">Неверный PIN-код</div>
+        </div>
+    </form>
+    <div class="footer">
+        <a href="https://github.com/xorkrus/ESP32-C3-MH-Z19C" target="_blank">Исходный код на GitHub</a>
+    </div>
+</div>
+<script>
+    document.querySelector('form').addEventListener('submit', function(e) {
+        var pin = document.querySelector('input[name="pin"]').value;
+        if (pin !== "0000") {
+            e.preventDefault();
+            document.getElementById('pinError').style.display = 'block';
+        }
+    });
+</script>
+</body>
+</html>
+)rawliteral";
+
   server.send(200, "text/html", html);
 }
 
@@ -782,7 +779,7 @@ void handleButton() {
 
   switch (btnState) {
     case BUTTON_IDLE:
-      if (pinState == LOW) { // нажата
+      if (pinState == LOW) {
         btnState = BUTTON_PRESSED;
         buttonPressTime = now;
         buttonLongPressHandled = false;
@@ -790,30 +787,26 @@ void handleButton() {
       break;
 
     case BUTTON_PRESSED:
-      if (pinState == HIGH) { // отпущена
-        // Краткое нажатие
+      if (pinState == HIGH) {
         if (!buttonLongPressHandled && (now - buttonPressTime) < LONG_PRESS_MS) {
-          // короткое нажатие: пробуждение на config.button_wake_time секунд
+          // короткое нажатие
           buttonWakeUntil = now + config.button_wake_time * 1000UL;
           scheduleEnabled = false;
         }
         btnState = BUTTON_IDLE;
       } else if ((now - buttonPressTime) >= LONG_PRESS_MS && !buttonLongPressHandled) {
-        // удержание началось
         buttonLongPressHandled = true;
-        // включаем экран и держим включённым, пока кнопка удерживается
-        buttonWakeUntil = now + 0xFFFFFFFF; // очень большое значение, чтобы экран не выключался по расписанию
+        buttonWakeUntil = now + 0xFFFFFFFF; // очень большое значение
         scheduleEnabled = false;
         setDisplayPower(true);
       }
       break;
   }
 
-  // Если мы в режиме удержания и кнопка отпущена, выключаем экран
   if (buttonLongPressHandled && digitalRead(config.button_gpio) == HIGH) {
-    buttonWakeUntil = 0; // отключаем принудительное включение
+    buttonWakeUntil = 0;
     scheduleEnabled = true;
-    setDisplayPower(shouldDisplayOn()); // обновляем состояние по расписанию
+    setDisplayPower(shouldDisplayOn());
     btnState = BUTTON_IDLE;
   }
 }
@@ -941,7 +934,6 @@ void loop() {
   if (now - lastUpdate >= UPDATE_INTERVAL) {
     lastUpdate = now;
     if (displayState) {
-      // Обновляем смещение цифр, но корректируем позже при отрисовке
       numberOffsetX = random(-3, 4);
       numberOffsetY = random(-3, 4);
       updateDisplayContent();
