@@ -1,12 +1,20 @@
 /*
-   CO₂ Monitor with PWM sensor (MH-Z19C) – Version 2.2
-   Features:
-   - Web configuration (Wi-Fi, MQTT, NTP, screen schedule, button, CO₂ thresholds, fonts, temperature topic)
-   - OLED SSD1306 with animation (bubbles, drifting numbers)
-   - Button with two modes: short press (wake for set time) / long press (wake while held)
-   - MQTT publishing for CO₂ and temperature (DS18B20)
-   - Configurable PIN code for saving settings
-   - Responsive web interface with version and build timestamp
+Монитор CO₂ с ШИМ-датчиком (MH-Z19C) – Версия 2.6
+Функции:
+- Веб-конфигурация (Wi-Fi, MQTT, NTP, расписание экрана, кнопка, пороговые значения CO₂, размеры шрифтов, настройки DS18B20)
+- OLED SSD1306 с анимацией (пузырьки, движущиеся цифры)
+- Кнопка с двумя режимами: короткое нажатие (пробуждение на заданное время) / длительное нажатие (пробуждение при удержании)
+- Публикация данных о CO₂ и температуре через MQTT (DS18B20)
+- Настраиваемый PIN-код для сохранения настроек
+- Адаптивный веб-интерфейс с указанием версии, метки времени сборки, графиков CO₂/температуры в реальном времени
+- Регулируемые размеры шрифта для CO₂, температуры и информационного текста (1–3)
+- IP-адрес отображается на экране в течение 5 секунд после подключения к Wi-Fi
+- Улучшенная заставка: метка уровня CO₂ перемещается между левым/правым нижним углами
+- Анимация пузырьков: заполненные и обведенные пузырьки, без наложения с цифрами CO₂
+- Режим точки доступа для настройки при сбое Wi-Fi-соединения
+- НОВОЕ: Страница конфигурации с вкладками и горизонтальной прокруткой на мобильных устройствах
+- НОВОЕ: Отключение анимации (пузырьков) и отключение движения (дрейф, рамка, переключение положения уровня)
+- ИСПРАВЛЕНИЕ: Панель управления работает в режиме точки доступа с данными в реальном времени и графиками
 */
 
 #include <Wire.h>
@@ -23,7 +31,7 @@
 #include <DallasTemperature.h>
 
 // ========== ВЕРСИЯ И ДАТА СБОРКИ ==========
-#define FW_VERSION "2.2"
+#define FW_VERSION "2.6"
 #define BUILD_TIMESTAMP __DATE__ " " __TIME__
 
 // ========== ПИНЫ ==========
@@ -31,7 +39,6 @@
 #define I2C_SCL   3
 #define PWM_PIN   4
 #define BUTTON_PIN 5   // кнопка с подтяжкой к GND
-#define ONE_WIRE_BUS 6 // пин для DS18B20
 
 // ========== ДИСПЛЕЙ ==========
 #define SCREEN_WIDTH  128
@@ -40,11 +47,6 @@
 
 TwoWire I2Cbus = TwoWire(0);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &I2Cbus, OLED_RESET);
-
-// ========== ШРИФТЫ ==========
-#include <Fonts/FreeMonoBold9pt7b.h>
-const GFXfont* selectedFont = NULL;
-bool useBigFont = false;
 
 // ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
 WiFiUDP ntpUDP;
@@ -76,27 +78,45 @@ struct Bubble {
   int radius;
   int speed;
   bool active;
+  bool filled;   // true = закрашенный, false = контурный
 };
-#define MAX_BUBBLES 10
+#define MAX_BUBBLES 15
 Bubble bubbles[MAX_BUBBLES];
 int numberOffsetX = 0;
 int numberOffsetY = 0;
 
-// Для чередования позиции температуры
-int tempPosition = 0; // 0 - справа снизу, 1 - справа сверху, 2 - слева сверху
-unsigned long lastTempPosChange = 0;
-const unsigned long TEMP_POS_INTERVAL = 5000; // менять позицию каждые 5 секунд
+// Для чередования позиции уровня CO2
+int levelNamePos = 0; // 0 - левый нижний, 1 - правый нижний
+unsigned long lastLevelPosChange = 0;
+const unsigned long LEVEL_POS_INTERVAL = 10000; // менять позицию каждые 10 секунд
+
+// Для хранения истории (до 20 измерений)
+#define HISTORY_SIZE 20
+int co2History[HISTORY_SIZE];
+float tempHistory[HISTORY_SIZE];
+int historyIndex = 0;
+int historyCount = 0;
+unsigned long lastHistoryAdd = 0;
+const unsigned long HISTORY_ADD_INTERVAL = 60000; // добавляем в историю раз в минуту
+
+// Для отображения IP
+String lastIP = "";
+unsigned long ipDisplayUntil = 0;
+
+// Режим работы Wi-Fi
+bool apMode = false;          // true если работаем в режиме точки доступа
+const String apSSIDprefix = "CO2Monitor_";   // префикс SSID в AP режиме
 
 // ========== НАСТРОЙКИ ==========
 struct Config {
-  char ssid[32] = "SSID";
-  char password[64] = "PASS";
+  char ssid[32] = "xopkland";
+  char password[64] = "1234567890987654321";
   char mqtt_server[40] = "192.168.1.42";
   int mqtt_port = 1883;
   char mqtt_user[32] = "";
   char mqtt_pass[32] = "";
   char mqtt_topic_co2[64] = "CO2/ppm";
-  char mqtt_topic_temp[64] = "temperature";  // новый топик для температуры
+  char mqtt_topic_temp[64] = "temperature";
   char ntp_server[40] = "pool.ntp.org";
   int timezone = 3;
 
@@ -109,12 +129,23 @@ struct Config {
   int thresholds[4] = {800, 1200, 1800, 5000};
   char level_names[4][32] = {"Норма", "Внимание", "Опасно", "Полный абзац"};
 
-  bool use_custom_font = false;
+  // Датчик температуры
+  bool temp_enabled = true;
+  int temp_gpio = 6;
+
+  // Настройки шрифтов
+  int font_scale_co2 = 3;      // размер шрифта для PPM (1..3)
+  int font_scale_temp = 1;     // размер шрифта температуры (1..3)
+  int font_scale_info = 1;     // размер шрифта надписи порогов (1..3)
+
+  // Режимы отображения
+  bool disable_animation = false;  // отключает пузырьки
+  bool disable_movement = false;   // отключает дрейф цифр, чередование позиции, рамку
 } config;
 
 // ========== ДАТЧИК ТЕМПЕРАТУРЫ ==========
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
+OneWire* oneWire = nullptr;
+DallasTemperature* sensors = nullptr;
 
 // ========== КНОПКА (опрашиваем в loop) ==========
 enum ButtonState { BUTTON_IDLE, BUTTON_PRESSED, BUTTON_HELD };
@@ -132,7 +163,7 @@ void loadConfig() {
   if (SPIFFS.exists("/config.json")) {
     File file = SPIFFS.open("/config.json", "r");
     if (file) {
-      StaticJsonDocument<2048> doc;
+      StaticJsonDocument<4096> doc; // увеличили размер из-за новых полей
       DeserializationError error = deserializeJson(doc, file);
       if (!error) {
         strlcpy(config.ssid, doc["ssid"] | config.ssid, sizeof(config.ssid));
@@ -155,7 +186,20 @@ void loadConfig() {
           config.thresholds[i] = doc["thresholds"][i] | config.thresholds[i];
           strlcpy(config.level_names[i], doc["level_names"][i] | config.level_names[i], 32);
         }
-        config.use_custom_font = doc["use_custom_font"] | config.use_custom_font;
+        config.temp_enabled = doc["temp_enabled"] | config.temp_enabled;
+        config.temp_gpio = doc["temp_gpio"] | config.temp_gpio;
+        config.font_scale_co2 = doc["font_scale_co2"] | config.font_scale_co2;
+        config.font_scale_temp = doc["font_scale_temp"] | config.font_scale_temp;
+        config.font_scale_info = doc["font_scale_info"] | config.font_scale_info;
+        config.disable_animation = doc["disable_animation"] | config.disable_animation;
+        config.disable_movement = doc["disable_movement"] | config.disable_movement;
+
+        if (config.font_scale_co2 < 1) config.font_scale_co2 = 1;
+        if (config.font_scale_co2 > 3) config.font_scale_co2 = 3;
+        if (config.font_scale_temp < 1) config.font_scale_temp = 1;
+        if (config.font_scale_temp > 3) config.font_scale_temp = 3;
+        if (config.font_scale_info < 1) config.font_scale_info = 1;
+        if (config.font_scale_info > 3) config.font_scale_info = 3;
       } else {
         Serial.println("Failed to parse config.json");
       }
@@ -170,7 +214,7 @@ void loadConfig() {
 
 void saveConfig() {
   if (!SPIFFS.begin(true)) return;
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<4096> doc;
   doc["ssid"] = config.ssid;
   doc["password"] = config.password;
   doc["mqtt_server"] = config.mqtt_server;
@@ -192,7 +236,13 @@ void saveConfig() {
   for (int i = 0; i < 4; i++) thArr.add(config.thresholds[i]);
   JsonArray namesArr = doc.createNestedArray("level_names");
   for (int i = 0; i < 4; i++) namesArr.add(config.level_names[i]);
-  doc["use_custom_font"] = config.use_custom_font;
+  doc["temp_enabled"] = config.temp_enabled;
+  doc["temp_gpio"] = config.temp_gpio;
+  doc["font_scale_co2"] = config.font_scale_co2;
+  doc["font_scale_temp"] = config.font_scale_temp;
+  doc["font_scale_info"] = config.font_scale_info;
+  doc["disable_animation"] = config.disable_animation;
+  doc["disable_movement"] = config.disable_movement;
 
   File file = SPIFFS.open("/config.json", "w");
   if (file) {
@@ -265,11 +315,13 @@ void initBubbles() {
       bubbles[i].y = random(0, SCREEN_HEIGHT);
       bubbles[i].radius = random(2, 6);
       bubbles[i].speed = random(1, 3);
+      bubbles[i].filled = random(0, 2); // 50% закрашенных, 50% контурных
     }
   }
 }
 
 void updateBubbles() {
+  if (config.disable_animation) return;
   for (int i = 0; i < MAX_BUBBLES; i++) {
     if (bubbles[i].active) {
       bubbles[i].y -= bubbles[i].speed;
@@ -278,6 +330,7 @@ void updateBubbles() {
         bubbles[i].x = random(0, SCREEN_WIDTH);
         bubbles[i].radius = random(2, 6);
         bubbles[i].speed = random(1, 3);
+        bubbles[i].filled = random(0, 2);
       }
     } else {
       if (random(0, 100) < 2) {
@@ -286,15 +339,26 @@ void updateBubbles() {
         bubbles[i].y = SCREEN_HEIGHT + random(0, 10);
         bubbles[i].radius = random(2, 6);
         bubbles[i].speed = random(1, 3);
+        bubbles[i].filled = random(0, 2);
       }
     }
   }
 }
 
-void drawBubbles() {
+void drawBubbles(int digitsX, int digitsY, int digitsW, int digitsH) {
+  if (config.disable_animation) return;
   for (int i = 0; i < MAX_BUBBLES; i++) {
     if (bubbles[i].active) {
-      display.fillCircle(bubbles[i].x, bubbles[i].y, bubbles[i].radius, SSD1306_WHITE);
+      // Проверяем пересечение с областью цифр
+      bool intersects = (bubbles[i].x + bubbles[i].radius > digitsX && bubbles[i].x - bubbles[i].radius < digitsX + digitsW &&
+                         bubbles[i].y + bubbles[i].radius > digitsY && bubbles[i].y - bubbles[i].radius < digitsY + digitsH);
+      if (!intersects) {
+        if (bubbles[i].filled) {
+          display.fillCircle(bubbles[i].x, bubbles[i].y, bubbles[i].radius, SSD1306_WHITE);
+        } else {
+          display.drawCircle(bubbles[i].x, bubbles[i].y, bubbles[i].radius, SSD1306_WHITE);
+        }
+      }
     }
   }
 }
@@ -305,9 +369,24 @@ void updateDisplayContent() {
 
   display.clearDisplay();
 
-  // Анимация пузырьков
-  updateBubbles();
-  drawBubbles();
+  // Если нужно показать IP
+  if (ipDisplayUntil > millis()) {
+    display.setFont(NULL);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("IP:");
+    display.println(lastIP);
+    if (apMode) {
+      display.println("AP mode");
+      display.println("Connect to:");
+      display.println(apSSIDprefix + WiFi.macAddress().substring(9));
+    } else {
+      display.println("Connect to");
+      display.println("/config");
+    }
+    display.display();
+    return;
+  }
 
   // Определяем уровень CO2
   int levelIndex = 0;
@@ -319,39 +398,38 @@ void updateDisplayContent() {
     if (i == 3 && currentPpm >= config.thresholds[3]) levelIndex = 3;
   }
 
-  // Выбор шрифта для PPM
-  if (config.use_custom_font) {
-    display.setFont(&FreeMonoBold9pt7b);
-    display.setTextSize(1);
-  } else {
-    display.setFont(NULL);
-    display.setTextSize(3);
+  // Если отключено перемещение, фиксируем параметры
+  if (config.disable_movement) {
+    numberOffsetX = 0;
+    numberOffsetY = 0;
+    levelNamePos = 0; // всегда слева внизу
   }
 
-  // Отображаем цифры с плавающим смещением, корректируем выход за границы
-  int textWidth = 0;
+  // Рисуем CO₂
+  display.setFont(NULL);
+  display.setTextSize(config.font_scale_co2);
   char ppmStr[6];
   sprintf(ppmStr, "%d", currentPpm);
-  if (config.use_custom_font) {
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.getTextBounds(ppmStr, 0, 0, &x1, &y1, &w, &h);
-    textWidth = w;
-  } else {
-    textWidth = strlen(ppmStr) * 12; // примерная ширина символа 6x12 при размере 3
-  }
-
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(ppmStr, 0, 0, &x1, &y1, &w, &h);
+  int textWidth = w;
+  int textHeight = h;
   int x = (SCREEN_WIDTH / 2) - (textWidth / 2) + numberOffsetX;
-  int y = (SCREEN_HEIGHT / 2) - 12 + numberOffsetY; // центрируем
-
-  // Коррекция
+  int y = (SCREEN_HEIGHT / 2) - (textHeight / 2) + numberOffsetY;
   if (x < 0) x = 0;
   if (x + textWidth > SCREEN_WIDTH) x = SCREEN_WIDTH - textWidth;
   if (y < 0) y = 0;
-  if (y + 24 > SCREEN_HEIGHT) y = SCREEN_HEIGHT - 24;
+  if (y + textHeight > SCREEN_HEIGHT) y = SCREEN_HEIGHT - textHeight;
 
+  // Обновляем и рисуем пузырьки, если анимация включена
+  updateBubbles();
+  drawBubbles(x, y, textWidth, textHeight);
+
+  // Рисуем цифры
   display.setTextColor(SSD1306_WHITE);
   if (currentPpm < 0) {
+    display.setTextSize(1);
     display.setCursor(20, 20);
     display.println(F("ERR"));
   } else {
@@ -359,41 +437,35 @@ void updateDisplayContent() {
     display.print(ppmStr);
   }
 
-  // Отображаем уровень CO2 (внизу слева)
-  display.setFont(NULL);
-  display.setTextSize(1);
-  display.setCursor(5, SCREEN_HEIGHT - 8);
+  // Рисуем уровень CO₂ (всегда слева внизу при отключённом перемещении)
+  display.setTextSize(config.font_scale_info);
+  int levelX, levelY = SCREEN_HEIGHT - 8 * config.font_scale_info;
+  if (config.disable_movement || levelNamePos == 0) {
+    levelX = 3;
+  } else {
+    int levelWidth = strlen(config.level_names[levelIndex]) * 6 * config.font_scale_info;
+    levelX = SCREEN_WIDTH - levelWidth - 3;
+  }
+  display.setCursor(levelX, levelY);
   display.print(config.level_names[levelIndex]);
 
-  // Отображаем температуру, чередуя позиции
-  if (currentTemp > -100.0 && currentTemp < 100.0) {
+  // Рисуем температуру (в правом верхнем углу)
+  if (config.temp_enabled && currentTemp > -100.0 && currentTemp < 100.0) {
+    display.setTextSize(config.font_scale_temp);
     char tempStr[10];
     dtostrf(currentTemp, 4, 1, tempStr);
     strcat(tempStr, " C");
-
-    int tx, ty;
-    switch (tempPosition) {
-      case 0: // справа снизу
-        tx = SCREEN_WIDTH - 5 - (strlen(tempStr) * 6);
-        ty = SCREEN_HEIGHT - 8;
-        break;
-      case 1: // справа сверху
-        tx = SCREEN_WIDTH - 5 - (strlen(tempStr) * 6);
-        ty = 2;
-        break;
-      default: // слева сверху
-        tx = 5;
-        ty = 2;
-        break;
-    }
-    display.setCursor(tx, ty);
+    int tempWidth = strlen(tempStr) * 6 * config.font_scale_temp;
+    display.setCursor(SCREEN_WIDTH - tempWidth - 2, 2);
     display.print(tempStr);
   }
 
-  // Рамка в зависимости от уровня
-  display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
-  if (levelIndex >= 2) {
-    display.drawRect(1, 1, SCREEN_WIDTH-2, SCREEN_HEIGHT-2, SSD1306_WHITE);
+  // Рисуем рамку, если не отключено перемещение
+  if (!config.disable_movement) {
+    display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+    if (levelIndex >= 2) {
+      display.drawRect(1, 1, SCREEN_WIDTH-2, SCREEN_HEIGHT-2, SSD1306_WHITE);
+    }
   }
 
   display.display();
@@ -420,8 +492,12 @@ int readCO2FromPWM(int pin) {
 
 // ========== ЧТЕНИЕ ТЕМПЕРАТУРЫ ==========
 void readTemperature() {
-  sensors.requestTemperatures();
-  float temp = sensors.getTempCByIndex(0);
+  if (!config.temp_enabled || sensors == nullptr) {
+    currentTemp = -127.0;
+    return;
+  }
+  sensors->requestTemperatures();
+  float temp = sensors->getTempCByIndex(0);
   if (temp != DEVICE_DISCONNECTED_C) {
     currentTemp = temp;
   } else {
@@ -430,8 +506,27 @@ void readTemperature() {
 }
 
 // ========== WI-FI ==========
+void setupAP() {
+  String apSSID = apSSIDprefix + WiFi.macAddress().substring(9);
+  Serial.println("Starting Access Point: " + apSSID);
+  bool result = WiFi.softAP(apSSID.c_str(), "12345678");
+  if (result) {
+    Serial.println("AP Started. IP: " + WiFi.softAPIP().toString());
+    lastIP = WiFi.softAPIP().toString();
+    apMode = true;
+    ipDisplayUntil = millis() + 5000; // показать IP на 5 секунд
+  } else {
+    Serial.println("AP Failed!");
+  }
+}
+
 void setupWiFi() {
+  if (apMode) return; // уже в режиме AP, не пытаемся подключиться
+
+  if (WiFi.status() == WL_CONNECTED) return;
   Serial.print("Connecting to WiFi");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(config.ssid, config.password);
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
@@ -443,13 +538,18 @@ void setupWiFi() {
     Serial.println(" OK!");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
+    lastIP = WiFi.localIP().toString();
+    ipDisplayUntil = millis() + 5000; // показать IP на 5 секунд
+    apMode = false;
   } else {
-    Serial.println(" Failed! Will retry later.");
+    Serial.println(" Failed! Switching to AP mode.");
+    setupAP();
   }
 }
 
 // ========== MQTT ==========
 void reconnectMQTT() {
+  if (apMode) return; // в AP режиме MQTT не используем
   while (!mqttClient.connected()) {
     Serial.print("Connecting to MQTT...");
     String clientId = "ESP32C3-" + String(random(0xffff), HEX);
@@ -474,6 +574,7 @@ void reconnectMQTT() {
 }
 
 void sendMqtt() {
+  if (apMode) return; // не отправляем в AP режиме
   if (currentPpm > 0) {
     String payload = String(currentPpm);
     if (mqttClient.publish(config.mqtt_topic_co2, payload.c_str())) {
@@ -483,7 +584,7 @@ void sendMqtt() {
       Serial.println("MQTT CO2 publish failed");
     }
   }
-  if (currentTemp > -100.0 && currentTemp < 100.0) {
+  if (config.temp_enabled && currentTemp > -100.0 && currentTemp < 100.0) {
     String payload = String(currentTemp, 1);
     if (mqttClient.publish(config.mqtt_topic_temp, payload.c_str())) {
       Serial.print("MQTT Temp sent: ");
@@ -494,8 +595,179 @@ void sendMqtt() {
   }
 }
 
+// ========== ИСТОРИЯ ДЛЯ ГРАФИКОВ ==========
+void addToHistory(int co2, float temp) {
+  co2History[historyIndex] = co2;
+  tempHistory[historyIndex] = temp;
+  historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+  if (historyCount < HISTORY_SIZE) historyCount++;
+}
+
 // ========== WEB-СЕРВЕР ==========
 void handleRoot() {
+  String modeInfo = apMode ? " (AP mode)" : "";
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>CO₂ Monitor Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: #f0f2f5;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 10px;
+        }
+        .dashboard {
+            max-width: 800px;
+            width: 100%;
+            background: white;
+            border-radius: 12px;
+            padding: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .values-row {
+            display: flex;
+            justify-content: center;
+            align-items: baseline;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+        .co2-value {
+            font-size: 4rem;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .temp-value {
+            font-size: 2rem;
+            color: #2c3e50;
+        }
+        canvas {
+            max-width: 100%;
+            height: auto;
+            background: #fff;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+        .config-link {
+            margin-top: 15px;
+        }
+        .config-link a {
+            color: #2c3e50;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        .footer {
+            margin-top: 15px;
+            font-size: 0.8rem;
+            color: #777;
+        }
+        .mode-badge {
+            background: #e67e22;
+            color: white;
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            margin-left: 10px;
+            vertical-align: middle;
+        }
+        @media (max-width: 600px) {
+            .co2-value { font-size: 2.5rem; }
+            .temp-value { font-size: 1.5rem; }
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<div class="dashboard">
+    <h1>CO₂ Monitor)rawliteral" + modeInfo + R"rawliteral(</h1>
+    <div class="values-row">
+        <div class="co2-value" id="co2">-- ppm</div>
+        <div class="temp-value" id="temp">-- °C</div>
+    </div>
+    <canvas id="co2Chart" width="600" height="300"></canvas>
+    <div class="config-link"><a href="/config">Настройки</a></div>
+    <div class="footer">Версия )rawliteral" + String(FW_VERSION) + R"rawliteral( | Сборка: )rawliteral" + String(BUILD_TIMESTAMP) + R"rawliteral(</div>
+</div>
+<script>
+    const ctx = document.getElementById('co2Chart').getContext('2d');
+    let chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [{
+                label: 'CO₂ (ppm)',
+                data: [],
+                borderColor: 'rgb(75, 192, 192)',
+                tension: 0.1,
+                fill: false
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            scales: {
+                y: { title: { display: true, text: 'ppm' } }
+            }
+        }
+    });
+
+    function fetchData() {
+        fetch('/api/data')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('co2').innerText = data.current_co2 + ' ppm';
+                if (data.current_temp !== null) {
+                    document.getElementById('temp').innerText = data.current_temp.toFixed(1) + ' °C';
+                } else {
+                    document.getElementById('temp').innerText = '-- °C';
+                }
+                chart.data.labels = data.labels;
+                chart.data.datasets[0].data = data.co2_values;
+                chart.update();
+            })
+            .catch(error => {
+                console.error('Error fetching data:', error);
+                setTimeout(fetchData, 5000);
+            });
+    }
+    fetchData();
+    setInterval(fetchData, 10000);
+</script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void handleApiData() {
+  StaticJsonDocument<2048> doc;
+  doc["current_co2"] = currentPpm;
+  doc["current_temp"] = (config.temp_enabled && currentTemp > -100.0) ? currentTemp : (float)NULL;
+  JsonArray labels = doc.createNestedArray("labels");
+  JsonArray co2Arr = doc.createNestedArray("co2_values");
+  // Формируем метки времени (можно просто индексы)
+  for (int i = 0; i < historyCount; i++) {
+    int idx = (historyIndex - historyCount + i + HISTORY_SIZE) % HISTORY_SIZE;
+    labels.add(i + 1);
+    co2Arr.add(co2History[idx]);
+  }
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleConfig() {
+  String modeInfo = apMode ? " (AP mode)" : "";
   String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="ru">
@@ -513,7 +785,7 @@ void handleRoot() {
             color: #333;
         }
         .container {
-            max-width: 800px;
+            max-width: 900px;
             margin: 0 auto;
             background: white;
             border-radius: 12px;
@@ -535,14 +807,54 @@ void handleRoot() {
             opacity: 0.8;
             margin-top: 5px;
         }
+        .tabs-wrapper {
+            overflow-x: auto;
+            overflow-y: hidden;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: thin;
+            background: #ecf0f1;
+            border-bottom: 1px solid #ddd;
+        }
+        .tabs {
+            display: flex;
+            flex-wrap: nowrap;
+            min-width: min-content;
+            white-space: nowrap;
+        }
+        .tab-btn {
+            background: none;
+            border: none;
+            padding: 12px 20px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: 0.2s;
+            color: #2c3e50;
+            white-space: nowrap;
+        }
+        .tab-btn:hover {
+            background: #d5dbdb;
+        }
+        .tab-btn.active {
+            background: white;
+            border-bottom: 2px solid #2c3e50;
+            font-weight: bold;
+        }
+        .tab-content {
+            display: none;
+            padding: 20px;
+        }
+        .tab-content.active {
+            display: block;
+        }
         .section {
-            border-bottom: 1px solid #eee;
-            padding: 15px 20px;
+            margin-bottom: 20px;
         }
         .section h2 {
-            margin: 0 0 10px 0;
+            margin: 0 0 15px 0;
             font-size: 1.2rem;
             color: #2c3e50;
+            border-left: 4px solid #2c3e50;
+            padding-left: 10px;
         }
         .form-group {
             margin-bottom: 12px;
@@ -552,7 +864,7 @@ void handleRoot() {
         }
         .form-group label {
             flex: 1;
-            min-width: 120px;
+            min-width: 140px;
             font-weight: 500;
             margin-bottom: 5px;
         }
@@ -631,84 +943,198 @@ void handleRoot() {
             .form-group label {
                 margin-bottom: 5px;
             }
+            .tab-btn {
+                padding: 10px 15px;
+                font-size: 0.85rem;
+            }
+        }
+        @media (max-width: 480px) {
+            .tab-btn {
+                padding: 8px 12px;
+                font-size: 0.8rem;
+            }
         }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
-        <h1>CO₂ Monitor</h1>
+        <h1>CO₂ Monitor)rawliteral" + modeInfo + R"rawliteral(</h1>
         <div class="version">Версия )rawliteral" + String(FW_VERSION) + R"rawliteral( | Сборка: )rawliteral" + String(BUILD_TIMESTAMP) + R"rawliteral(</div>
     </div>
+
+    <div class="tabs-wrapper">
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="wifi">Wi-Fi</button>
+            <button class="tab-btn" data-tab="mqtt">MQTT</button>
+            <button class="tab-btn" data-tab="ntp">NTP</button>
+            <button class="tab-btn" data-tab="schedule">Расписание</button>
+            <button class="tab-btn" data-tab="button">Кнопка</button>
+            <button class="tab-btn" data-tab="co2">CO₂ пороги</button>
+            <button class="tab-btn" data-tab="temp">Температура</button>
+            <button class="tab-btn" data-tab="display">Дисплей</button>
+        </div>
+    </div>
+
     <form method="POST" action="/save">
 )rawliteral";
 
-  // Wi-Fi
-  html += "<div class='section'><h2>Wi-Fi</h2>";
-  html += "<div class='form-group'><label>SSID:</label><input name='ssid' value='" + String(config.ssid) + "'></div>";
-  html += "<div class='form-group'><label>Пароль:</label><input name='password' type='password' value='" + String(config.password) + "'></div></div>";
+  // ---- Wi-Fi ----
+  html += R"rawliteral(
+        <div class="tab-content active" id="wifi">
+            <div class="section">
+                <h2>Настройки Wi-Fi</h2>
+                <div class="form-group"><label>SSID:</label><input name='ssid' value=')rawliteral" + String(config.ssid) + R"rawliteral('></div>
+                <div class="form-group"><label>Пароль:</label><input name='password' type='password' value=')rawliteral" + String(config.password) + R"rawliteral('></div>
+            </div>
+        </div>
+)rawliteral";
 
-  // MQTT
-  html += "<div class='section'><h2>MQTT</h2>";
-  html += "<div class='form-group'><label>Сервер:</label><input name='mqtt_server' value='" + String(config.mqtt_server) + "'></div>";
-  html += "<div class='form-group'><label>Порт:</label><input name='mqtt_port' value='" + String(config.mqtt_port) + "'></div>";
-  html += "<div class='form-group'><label>Логин:</label><input name='mqtt_user' value='" + String(config.mqtt_user) + "'></div>";
-  html += "<div class='form-group'><label>Пароль:</label><input name='mqtt_pass' type='password' value='" + String(config.mqtt_pass) + "'></div>";
-  html += "<div class='form-group'><label>Топик CO₂:</label><input name='mqtt_topic_co2' value='" + String(config.mqtt_topic_co2) + "'></div>";
-  html += "<div class='form-group'><label>Топик температуры:</label><input name='mqtt_topic_temp' value='" + String(config.mqtt_topic_temp) + "'></div></div>";
+  // ---- MQTT ----
+  html += R"rawliteral(
+        <div class="tab-content" id="mqtt">
+            <div class="section">
+                <h2>Настройки MQTT</h2>
+                <div class="form-group"><label>Сервер:</label><input name='mqtt_server' value=')rawliteral" + String(config.mqtt_server) + R"rawliteral('></div>
+                <div class="form-group"><label>Порт:</label><input name='mqtt_port' value=')rawliteral" + String(config.mqtt_port) + R"rawliteral('></div>
+                <div class="form-group"><label>Логин:</label><input name='mqtt_user' value=')rawliteral" + String(config.mqtt_user) + R"rawliteral('></div>
+                <div class="form-group"><label>Пароль:</label><input name='mqtt_pass' type='password' value=')rawliteral" + String(config.mqtt_pass) + R"rawliteral('></div>
+                <div class="form-group"><label>Топик CO₂:</label><input name='mqtt_topic_co2' value=')rawliteral" + String(config.mqtt_topic_co2) + R"rawliteral('></div>
+                <div class="form-group"><label>Топик температуры:</label><input name='mqtt_topic_temp' value=')rawliteral" + String(config.mqtt_topic_temp) + R"rawliteral('></div>
+            </div>
+        </div>
+)rawliteral";
 
-  // NTP
-  html += "<div class='section'><h2>NTP</h2>";
-  html += "<div class='form-group'><label>Сервер:</label><input name='ntp_server' value='" + String(config.ntp_server) + "'></div>";
-  html += "<div class='form-group'><label>Часовой пояс (часы):</label><input name='timezone' value='" + String(config.timezone) + "'></div></div>";
+  // ---- NTP ----
+  html += R"rawliteral(
+        <div class="tab-content" id="ntp">
+            <div class="section">
+                <h2>Настройки NTP</h2>
+                <div class="form-group"><label>Сервер:</label><input name='ntp_server' value=')rawliteral" + String(config.ntp_server) + R"rawliteral('></div>
+                <div class="form-group"><label>Часовой пояс (часы):</label><input name='timezone' value=')rawliteral" + String(config.timezone) + R"rawliteral('></div>
+            </div>
+        </div>
+)rawliteral";
 
-  // Расписание
-  html += "<div class='section'><h2>Расписание выключения экрана</h2>";
-  html += "<div class='form-group'><small>Формат: HH:MM-HH:MM,маска_дней (маска: биты 0-6, бит0=пн...бит6=вс). Пример: 0:00-6:00,127</small></div>";
-  for (int i = 0; i < 3; i++) {
-    html += "<div class='schedule-group'><input name='schedule" + String(i) + "' value='" + String(config.schedule[i]) + "' placeholder='Интервал " + String(i+1) + "'></div>";
-  }
-  html += "</div>";
+  // ---- Расписание ----
+  html += R"rawliteral(
+        <div class="tab-content" id="schedule">
+            <div class="section">
+                <h2>Расписание выключения экрана</h2>
+                <div class="form-group"><small>Формат: HH:MM-HH:MM,маска_дней (маска: биты 0-6, бит0=пн...бит6=вс). Пример: 0:00-6:00,127</small></div>
+                <div class="schedule-group"><input name='schedule0' value=')rawliteral" + String(config.schedule[0]) + R"rawliteral(' placeholder='Интервал 1'></div>
+                <div class="schedule-group"><input name='schedule1' value=')rawliteral" + String(config.schedule[1]) + R"rawliteral(' placeholder='Интервал 2'></div>
+                <div class="schedule-group"><input name='schedule2' value=')rawliteral" + String(config.schedule[2]) + R"rawliteral(' placeholder='Интервал 3'></div>
+            </div>
+        </div>
+)rawliteral";
 
-  // Кнопка
-  html += "<div class='section'><h2>Кнопка пробуждения</h2>";
-  html += "<div class='form-group'><label>Включена:</label><input type='checkbox' name='button_enabled' " + String(config.button_enabled ? "checked" : "") + "></div>";
-  html += "<div class='form-group'><label>GPIO:</label><input name='button_gpio' value='" + String(config.button_gpio) + "'></div>";
-  html += "<div class='form-group'><label>Время пробуждения (сек):</label><input name='button_wake_time' value='" + String(config.button_wake_time) + "'></div>";
-  html += "<div class='form-group'><small>* Краткое нажатие = пробуждение на указанное время. Долгое удержание = пробуждение на время удержания.</small></div></div>";
+  // ---- Кнопка ----
+  String btnChecked = config.button_enabled ? "checked" : "";
+  html += R"rawliteral(
+        <div class="tab-content" id="button">
+            <div class="section">
+                <h2>Кнопка пробуждения</h2>
+                <div class="form-group"><label>Включена:</label><input type='checkbox' name='button_enabled' )rawliteral" + btnChecked + R"rawliteral('></div>
+                <div class="form-group"><label>GPIO:</label><input name='button_gpio' value=')rawliteral" + String(config.button_gpio) + R"rawliteral('></div>
+                <div class="form-group"><label>Время пробуждения (сек):</label><input name='button_wake_time' value=')rawliteral" + String(config.button_wake_time) + R"rawliteral('></div>
+                <div class="form-group"><small>* Краткое нажатие = пробуждение на указанное время. Долгое удержание = пробуждение на время удержания.</small></div>
+            </div>
+        </div>
+)rawliteral";
 
-  // CO2 thresholds
-  html += "<div class='section'><h2>Пороги CO₂</h2>";
+  // ---- CO₂ пороги ----
+  html += R"rawliteral(
+        <div class="tab-content" id="co2">
+            <div class="section">
+                <h2>Пороги CO₂</h2>
+)rawliteral";
   for (int i = 0; i < 4; i++) {
     html += "<div class='threshold-group'>";
     html += "<input name='threshold" + String(i) + "' value='" + String(config.thresholds[i]) + "' placeholder='Порог " + String(i+1) + "' size='5'>";
     html += "<input name='levelname" + String(i) + "' value='" + String(config.level_names[i]) + "' placeholder='Название уровня' style='flex:2'>";
     html += "</div>";
   }
-  html += "</div>";
-
-  // Font
-  html += "<div class='section'><h2>Дисплей</h2>";
-  html += "<div class='form-group'><label>Использовать жирный шрифт:</label><input type='checkbox' name='use_custom_font' " + String(config.use_custom_font ? "checked" : "") + "></div></div>";
-
-  // Footer
   html += R"rawliteral(
-        <div class="section">
-            <div class="pin-group">
-                <div class="form-group">
-                    <label>ПИН-код для сохранения:</label>
-                    <input type="password" name="pin" placeholder="0000" required>
-                </div>
             </div>
-            <button type="submit" class="btn">Сохранить и перезагрузить</button>
-            <div class="error" id="pinError" style="display:none;">Неверный PIN-код</div>
         </div>
+)rawliteral";
+
+  // ---- Температура ----
+  String tempChecked = config.temp_enabled ? "checked" : "";
+  html += R"rawliteral(
+        <div class="tab-content" id="temp">
+            <div class="section">
+                <h2>Датчик температуры DS18B20</h2>
+                <div class="form-group"><label>Включен:</label><input type='checkbox' name='temp_enabled' )rawliteral" + tempChecked + R"rawliteral('></div>
+                <div class="form-group"><label>GPIO:</label><input name='temp_gpio' value=')rawliteral" + String(config.temp_gpio) + R"rawliteral('></div>
+            </div>
+        </div>
+)rawliteral";
+
+  // ---- Дисплей ----
+  html += R"rawliteral(
+        <div class="tab-content" id="display">
+            <div class="section">
+                <h2>Настройки дисплея</h2>
+                <div class="form-group"><label>Размер шрифта PPM (1-3):</label><select name='font_scale_co2'>
+)rawliteral";
+  for (int i = 1; i <= 3; i++) {
+    html += "<option value='" + String(i) + "'" + (config.font_scale_co2 == i ? " selected" : "") + ">" + String(i) + "</option>";
+  }
+  html += R"rawliteral(
+                </select></div>
+                <div class="form-group"><label>Размер шрифта температуры (1-3):</label><select name='font_scale_temp'>
+)rawliteral";
+  for (int i = 1; i <= 3; i++) {
+    html += "<option value='" + String(i) + "'" + (config.font_scale_temp == i ? " selected" : "") + ">" + String(i) + "</option>";
+  }
+  html += R"rawliteral(
+                </select></div>
+                <div class="form-group"><label>Размер шрифта инфо (1-3):</label><select name='font_scale_info'>
+)rawliteral";
+  for (int i = 1; i <= 3; i++) {
+    html += "<option value='" + String(i) + "'" + (config.font_scale_info == i ? " selected" : "") + ">" + String(i) + "</option>";
+  }
+  String animChecked = config.disable_animation ? "checked" : "";
+  String moveChecked = config.disable_movement ? "checked" : "";
+  html += R"rawliteral(
+                </select></div>
+                <div class="form-group"><label>Отключить анимацию (пузырьки):</label><input type='checkbox' name='disable_animation' )rawliteral" + animChecked + R"rawliteral('></div>
+                <div class="form-group"><label>Отключить перемещение (дрейф, рамка):</label><input type='checkbox' name='disable_movement' )rawliteral" + moveChecked + R"rawliteral('></div>
+                <div class="form-group"><small>При отключении перемещения цифры фиксируются по центру, рамка не рисуется, уровень CO₂ всегда слева внизу.</small></div>
+            </div>
+        </div>
+)rawliteral";
+
+  // ---- PIN и кнопка сохранения ----
+  html += R"rawliteral(
+        <div class="pin-group">
+            <div class="form-group">
+                <label>ПИН-код для сохранения:</label>
+                <input type="password" name="pin" placeholder="0000" required>
+            </div>
+        </div>
+        <button type="submit" class="btn">Сохранить и перезагрузить</button>
+        <div class="error" id="pinError" style="display:none;">Неверный PIN-код</div>
     </form>
+
     <div class="footer">
-        <a href="https://github.com/xorkrus/ESP32-C3-MH-Z19C" target="_blank">Исходный код на GitHub</a>
+        <a href="/">Вернуться к дашборду</a> | <a href="https://github.com/xorkrus/ESP32-C3-MH-Z19C" target="_blank">Исходный код на GitHub</a>
     </div>
 </div>
+
 <script>
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const tabId = btn.getAttribute('data-tab');
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+        });
+    });
+
     document.querySelector('form').addEventListener('submit', function(e) {
         var pin = document.querySelector('input[name="pin"]').value;
         if (pin !== "0000") {
@@ -755,7 +1181,21 @@ void handleSave() {
     String nameParam = "levelname" + String(i);
     if (server.hasArg(nameParam)) strlcpy(config.level_names[i], server.arg(nameParam).c_str(), 32);
   }
-  config.use_custom_font = server.hasArg("use_custom_font");
+  config.temp_enabled = server.hasArg("temp_enabled");
+  if (server.hasArg("temp_gpio")) config.temp_gpio = server.arg("temp_gpio").toInt();
+
+  if (server.hasArg("font_scale_co2")) config.font_scale_co2 = server.arg("font_scale_co2").toInt();
+  if (server.hasArg("font_scale_temp")) config.font_scale_temp = server.arg("font_scale_temp").toInt();
+  if (server.hasArg("font_scale_info")) config.font_scale_info = server.arg("font_scale_info").toInt();
+  config.disable_animation = server.hasArg("disable_animation");
+  config.disable_movement = server.hasArg("disable_movement");
+
+  if (config.font_scale_co2 < 1) config.font_scale_co2 = 1;
+  if (config.font_scale_co2 > 3) config.font_scale_co2 = 3;
+  if (config.font_scale_temp < 1) config.font_scale_temp = 1;
+  if (config.font_scale_temp > 3) config.font_scale_temp = 3;
+  if (config.font_scale_info < 1) config.font_scale_info = 1;
+  if (config.font_scale_info > 3) config.font_scale_info = 3;
 
   saveConfig();
   server.send(200, "text/html", "<html><body><h2>Настройки сохранены, перезагрузка...</h2></body></html>");
@@ -765,6 +1205,8 @@ void handleSave() {
 
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/config", HTTP_GET, handleConfig);
+  server.on("/api/data", HTTP_GET, handleApiData);
   server.on("/save", HTTP_POST, handleSave);
   server.begin();
   Serial.println("HTTP server started");
@@ -834,11 +1276,11 @@ void setup() {
   // Загрузка конфигурации
   loadConfig();
 
-  // Настройка шрифта
-  if (config.use_custom_font) {
-    display.setFont(&FreeMonoBold9pt7b);
-  } else {
-    display.setFont(NULL);
+  // Настройка датчика температуры
+  if (config.temp_enabled) {
+    oneWire = new OneWire(config.temp_gpio);
+    sensors = new DallasTemperature(oneWire);
+    sensors->begin();
   }
 
   // Настройка пинов
@@ -847,23 +1289,30 @@ void setup() {
     pinMode(config.button_gpio, INPUT_PULLUP);
   }
 
-  // Инициализация DS18B20
-  sensors.begin();
-
-  // Wi-Fi
+  // Wi-Fi (попытка подключиться к сохранённой сети, при неудаче - AP)
   setupWiFi();
 
-  // MQTT
-  mqttClient.setServer(config.mqtt_server, config.mqtt_port);
+  // MQTT (если не в AP режиме)
+  if (!apMode) {
+    mqttClient.setServer(config.mqtt_server, config.mqtt_port);
+  }
 
-  // NTP
-  timeClient.begin();
-  timeClient.setTimeOffset(config.timezone * 3600);
-  timeClient.update();
+  // NTP (только если не AP режим)
+  if (!apMode) {
+    timeClient.begin();
+    timeClient.setTimeOffset(config.timezone * 3600);
+    timeClient.update();
+  }
 
   // Анимация
   initBubbles();
   randomSeed(analogRead(0));
+
+  // История
+  for (int i = 0; i < HISTORY_SIZE; i++) {
+    co2History[i] = 0;
+    tempHistory[i] = -127.0;
+  }
 
   // Веб-сервер
   setupWebServer();
@@ -879,22 +1328,24 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Wi-Fi reconnect
-  if (WiFi.status() != WL_CONNECTED) {
+  // Wi-Fi reconnect только если не в AP режиме
+  if (!apMode && WiFi.status() != WL_CONNECTED) {
     setupWiFi();
   }
 
-  // MQTT reconnect & loop
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
-  }
-  mqttClient.loop();
+  // MQTT reconnect & loop (только если не AP режим)
+  if (!apMode) {
+    if (!mqttClient.connected()) {
+      reconnectMQTT();
+    }
+    mqttClient.loop();
 
-  // NTP update каждые 5 секунд
-  static unsigned long lastTimeUpdate = 0;
-  if (now - lastTimeUpdate >= 5000) {
-    lastTimeUpdate = now;
-    timeClient.update();
+    // NTP update каждые 5 секунд (только если не AP)
+    static unsigned long lastTimeUpdate = 0;
+    if (now - lastTimeUpdate >= 5000) {
+      lastTimeUpdate = now;
+      timeClient.update();
+    }
   }
 
   // Чтение PWM (CO2)
@@ -913,14 +1364,22 @@ void loop() {
   if (now - lastTempRead >= TEMP_READ_INTERVAL) {
     lastTempRead = now;
     readTemperature();
-    Serial.print("Temp: ");
-    Serial.println(currentTemp);
+    if (currentTemp > -100.0) {
+      Serial.print("Temp: ");
+      Serial.println(currentTemp);
+    }
   }
 
-  // Меняем позицию температуры каждые 5 секунд
-  if (now - lastTempPosChange >= TEMP_POS_INTERVAL) {
-    lastTempPosChange = now;
-    tempPosition = (tempPosition + 1) % 3;
+  // Добавление в историю
+  if (now - lastHistoryAdd >= HISTORY_ADD_INTERVAL) {
+    lastHistoryAdd = now;
+    addToHistory(currentPpm, currentTemp);
+  }
+
+  // Чередование позиции уровня CO2 (только если не отключено перемещение)
+  if (!config.disable_movement && (now - lastLevelPosChange >= LEVEL_POS_INTERVAL)) {
+    lastLevelPosChange = now;
+    levelNamePos = (levelNamePos + 1) % 2;
   }
 
   // Обработка кнопки
@@ -934,16 +1393,22 @@ void loop() {
   if (now - lastUpdate >= UPDATE_INTERVAL) {
     lastUpdate = now;
     if (displayState) {
-      numberOffsetX = random(-3, 4);
-      numberOffsetY = random(-3, 4);
+      // Дрейф только если не отключено перемещение
+      if (!config.disable_movement) {
+        numberOffsetX = random(-3, 4);
+        numberOffsetY = random(-3, 4);
+      } else {
+        numberOffsetX = 0;
+        numberOffsetY = 0;
+      }
       updateDisplayContent();
     }
   }
 
-  // MQTT отправка раз в минуту
-  if (now - lastMqttSend >= MQTT_INTERVAL) {
+  // MQTT отправка раз в минуту (только если не AP)
+  if (!apMode && (now - lastMqttSend >= MQTT_INTERVAL)) {
     lastMqttSend = now;
-    if (currentPpm > 0 || (currentTemp > -100.0 && currentTemp < 100.0)) {
+    if (currentPpm > 0 || (config.temp_enabled && currentTemp > -100.0 && currentTemp < 100.0)) {
       sendMqtt();
     }
   }
