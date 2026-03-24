@@ -1,20 +1,8 @@
 /*
-Монитор CO₂ с ШИМ-датчиком (MH-Z19C) – Версия 2.6
-Функции:
-- Веб-конфигурация (Wi-Fi, MQTT, NTP, расписание экрана, кнопка, пороговые значения CO₂, размеры шрифтов, настройки DS18B20)
-- OLED SSD1306 с анимацией (пузырьки, движущиеся цифры)
-- Кнопка с двумя режимами: короткое нажатие (пробуждение на заданное время) / длительное нажатие (пробуждение при удержании)
-- Публикация данных о CO₂ и температуре через MQTT (DS18B20)
-- Настраиваемый PIN-код для сохранения настроек
-- Адаптивный веб-интерфейс с указанием версии, метки времени сборки, графиков CO₂/температуры в реальном времени
-- Регулируемые размеры шрифта для CO₂, температуры и информационного текста (1–3)
-- IP-адрес отображается на экране в течение 5 секунд после подключения к Wi-Fi
-- Улучшенная заставка: метка уровня CO₂ перемещается между левым/правым нижним углами
-- Анимация пузырьков: заполненные и обведенные пузырьки, без наложения с цифрами CO₂
-- Режим точки доступа для настройки при сбое Wi-Fi-соединения
-- НОВОЕ: Страница конфигурации с вкладками и горизонтальной прокруткой на мобильных устройствах
-- НОВОЕ: Отключение анимации (пузырьков) и отключение движения (дрейф, рамка, переключение положения уровня)
-- ИСПРАВЛЕНИЕ: Панель управления работает в режиме точки доступа с данными в реальном времени и графиками
+   CO₂ Monitor with PWM sensor (MH-Z19C) – Version 2.6 (исправленная)
+   Исправления:
+   - Сохранение и загрузка чекбоксов "отключить анимацию" и "отключить перемещение"
+   - Сохранение полной строки расписания (с маской дней)
 */
 
 #include <Wire.h>
@@ -38,7 +26,7 @@
 #define I2C_SDA   2
 #define I2C_SCL   3
 #define PWM_PIN   4
-#define BUTTON_PIN 5   // кнопка с подтяжкой к GND
+#define BUTTON_PIN 5
 
 // ========== ДИСПЛЕЙ ==========
 #define SCREEN_WIDTH  128
@@ -58,56 +46,48 @@ PubSubClient mqttClient(espClient);
 WebServer server(80);
 
 unsigned long lastUpdate = 0;
-const unsigned long UPDATE_INTERVAL = 100;   // обновление экрана 10 раз в секунду (анимация)
+const unsigned long UPDATE_INTERVAL = 100;
 
 unsigned long lastMqttSend = 0;
-const unsigned long MQTT_INTERVAL = 60000;   // раз в минуту
+const unsigned long MQTT_INTERVAL = 60000;
 
 unsigned long lastTempRead = 0;
-const unsigned long TEMP_READ_INTERVAL = 5000; // читаем температуру каждые 5 секунд
+const unsigned long TEMP_READ_INTERVAL = 5000;
 
 int currentPpm = -1;
-float currentTemp = -127.0;   // невалидное значение
+float currentTemp = -127.0;
 bool displayState = true;
 bool scheduleEnabled = true;
 unsigned long buttonWakeUntil = 0;
 
-// Анимация
 struct Bubble {
   int x, y;
   int radius;
   int speed;
   bool active;
-  bool filled;   // true = закрашенный, false = контурный
+  bool filled;
 };
 #define MAX_BUBBLES 15
 Bubble bubbles[MAX_BUBBLES];
 int numberOffsetX = 0;
 int numberOffsetY = 0;
-
-// Для чередования позиции уровня CO2
-int levelNamePos = 0; // 0 - левый нижний, 1 - правый нижний
+int levelNamePos = 0;
 unsigned long lastLevelPosChange = 0;
-const unsigned long LEVEL_POS_INTERVAL = 10000; // менять позицию каждые 10 секунд
+const unsigned long LEVEL_POS_INTERVAL = 10000;
 
-// Для хранения истории (до 20 измерений)
 #define HISTORY_SIZE 20
 int co2History[HISTORY_SIZE];
 float tempHistory[HISTORY_SIZE];
 int historyIndex = 0;
 int historyCount = 0;
 unsigned long lastHistoryAdd = 0;
-const unsigned long HISTORY_ADD_INTERVAL = 60000; // добавляем в историю раз в минуту
+const unsigned long HISTORY_ADD_INTERVAL = 60000;
 
-// Для отображения IP
 String lastIP = "";
 unsigned long ipDisplayUntil = 0;
+bool apMode = false;
+const String apSSIDprefix = "CO2Monitor_";
 
-// Режим работы Wi-Fi
-bool apMode = false;          // true если работаем в режиме точки доступа
-const String apSSIDprefix = "CO2Monitor_";   // префикс SSID в AP режиме
-
-// ========== НАСТРОЙКИ ==========
 struct Config {
   char ssid[32] = "xopkland";
   char password[64] = "1234567890987654321";
@@ -119,40 +99,29 @@ struct Config {
   char mqtt_topic_temp[64] = "temperature";
   char ntp_server[40] = "pool.ntp.org";
   int timezone = 3;
-
   char schedule[3][32] = {"0:00-6:00,127", "8:00-16:00,31", ""};
-
   bool button_enabled = true;
   int button_gpio = BUTTON_PIN;
-  int button_wake_time = 30; // секунд
-
+  int button_wake_time = 30;
   int thresholds[4] = {800, 1200, 1800, 5000};
   char level_names[4][32] = {"Норма", "Внимание", "Опасно", "Полный абзац"};
-
-  // Датчик температуры
   bool temp_enabled = true;
   int temp_gpio = 6;
-
-  // Настройки шрифтов
-  int font_scale_co2 = 3;      // размер шрифта для PPM (1..3)
-  int font_scale_temp = 1;     // размер шрифта температуры (1..3)
-  int font_scale_info = 1;     // размер шрифта надписи порогов (1..3)
-
-  // Режимы отображения
-  bool disable_animation = false;  // отключает пузырьки
-  bool disable_movement = false;   // отключает дрейф цифр, чередование позиции, рамку
+  int font_scale_co2 = 3;
+  int font_scale_temp = 1;
+  int font_scale_info = 1;
+  bool disable_animation = false;
+  bool disable_movement = false;
 } config;
 
-// ========== ДАТЧИК ТЕМПЕРАТУРЫ ==========
 OneWire* oneWire = nullptr;
 DallasTemperature* sensors = nullptr;
 
-// ========== КНОПКА (опрашиваем в loop) ==========
 enum ButtonState { BUTTON_IDLE, BUTTON_PRESSED, BUTTON_HELD };
 ButtonState btnState = BUTTON_IDLE;
 unsigned long buttonPressTime = 0;
 bool buttonLongPressHandled = false;
-const unsigned long LONG_PRESS_MS = 1000; // 1 секунда для удержания
+const unsigned long LONG_PRESS_MS = 1000;
 
 // ========== ФУНКЦИИ РАБОТЫ С КОНФИГУРАЦИЕЙ ==========
 void loadConfig() {
@@ -163,7 +132,7 @@ void loadConfig() {
   if (SPIFFS.exists("/config.json")) {
     File file = SPIFFS.open("/config.json", "r");
     if (file) {
-      StaticJsonDocument<4096> doc; // увеличили размер из-за новых полей
+      JsonDocument doc;
       DeserializationError error = deserializeJson(doc, file);
       if (!error) {
         strlcpy(config.ssid, doc["ssid"] | config.ssid, sizeof(config.ssid));
@@ -176,16 +145,26 @@ void loadConfig() {
         strlcpy(config.mqtt_topic_temp, doc["mqtt_topic_temp"] | config.mqtt_topic_temp, sizeof(config.mqtt_topic_temp));
         strlcpy(config.ntp_server, doc["ntp_server"] | config.ntp_server, sizeof(config.ntp_server));
         config.timezone = doc["timezone"] | config.timezone;
-        for (int i = 0; i < 3; i++) {
-          strlcpy(config.schedule[i], doc["schedule"][i] | config.schedule[i], 32);
+        
+        JsonArray scheduleArr = doc["schedule"].as<JsonArray>();
+        for (int i = 0; i < 3 && i < scheduleArr.size(); i++) {
+          strlcpy(config.schedule[i], scheduleArr[i] | config.schedule[i], 32);
         }
+        
         config.button_enabled = doc["button_enabled"] | config.button_enabled;
         config.button_gpio = doc["button_gpio"] | config.button_gpio;
         config.button_wake_time = doc["button_wake_time"] | config.button_wake_time;
-        for (int i = 0; i < 4; i++) {
-          config.thresholds[i] = doc["thresholds"][i] | config.thresholds[i];
-          strlcpy(config.level_names[i], doc["level_names"][i] | config.level_names[i], 32);
+        
+        JsonArray thArr = doc["thresholds"].as<JsonArray>();
+        for (int i = 0; i < 4 && i < thArr.size(); i++) {
+          config.thresholds[i] = thArr[i] | config.thresholds[i];
         }
+        
+        JsonArray namesArr = doc["level_names"].as<JsonArray>();
+        for (int i = 0; i < 4 && i < namesArr.size(); i++) {
+          strlcpy(config.level_names[i], namesArr[i] | config.level_names[i], 32);
+        }
+        
         config.temp_enabled = doc["temp_enabled"] | config.temp_enabled;
         config.temp_gpio = doc["temp_gpio"] | config.temp_gpio;
         config.font_scale_co2 = doc["font_scale_co2"] | config.font_scale_co2;
@@ -214,7 +193,8 @@ void loadConfig() {
 
 void saveConfig() {
   if (!SPIFFS.begin(true)) return;
-  StaticJsonDocument<4096> doc;
+  JsonDocument doc;
+  
   doc["ssid"] = config.ssid;
   doc["password"] = config.password;
   doc["mqtt_server"] = config.mqtt_server;
@@ -225,17 +205,26 @@ void saveConfig() {
   doc["mqtt_topic_temp"] = config.mqtt_topic_temp;
   doc["ntp_server"] = config.ntp_server;
   doc["timezone"] = config.timezone;
-  JsonArray scheduleArr = doc.createNestedArray("schedule");
+  
+  JsonArray scheduleArr = doc["schedule"].to<JsonArray>();
   for (int i = 0; i < 3; i++) {
     scheduleArr.add(config.schedule[i]);
   }
+  
   doc["button_enabled"] = config.button_enabled;
   doc["button_gpio"] = config.button_gpio;
   doc["button_wake_time"] = config.button_wake_time;
-  JsonArray thArr = doc.createNestedArray("thresholds");
-  for (int i = 0; i < 4; i++) thArr.add(config.thresholds[i]);
-  JsonArray namesArr = doc.createNestedArray("level_names");
-  for (int i = 0; i < 4; i++) namesArr.add(config.level_names[i]);
+  
+  JsonArray thArr = doc["thresholds"].to<JsonArray>();
+  for (int i = 0; i < 4; i++) {
+    thArr.add(config.thresholds[i]);
+  }
+  
+  JsonArray namesArr = doc["level_names"].to<JsonArray>();
+  for (int i = 0; i < 4; i++) {
+    namesArr.add(config.level_names[i]);
+  }
+  
   doc["temp_enabled"] = config.temp_enabled;
   doc["temp_gpio"] = config.temp_gpio;
   doc["font_scale_co2"] = config.font_scale_co2;
@@ -260,12 +249,15 @@ bool isScheduleOff() {
   timeClient.update();
   int hour = timeClient.getHours();
   int minute = timeClient.getMinutes();
-  int day = timeClient.getDay(); // 0=вс, 1=пн..6=сб
+  int day = timeClient.getDay();
   int dayMask = (day == 0) ? (1 << 6) : (1 << (day - 1));
 
   for (int i = 0; i < 3; i++) {
     if (strlen(config.schedule[i]) == 0) continue;
-    char *token = strtok(config.schedule[i], ",");
+    // Используем копию, чтобы не повредить оригинальную строку
+    char scheduleCopy[32];
+    strcpy(scheduleCopy, config.schedule[i]);
+    char *token = strtok(scheduleCopy, ",");
     if (!token) continue;
     char *daysStr = strtok(NULL, ",");
     int mask = daysStr ? atoi(daysStr) : 127;
@@ -315,7 +307,7 @@ void initBubbles() {
       bubbles[i].y = random(0, SCREEN_HEIGHT);
       bubbles[i].radius = random(2, 6);
       bubbles[i].speed = random(1, 3);
-      bubbles[i].filled = random(0, 2); // 50% закрашенных, 50% контурных
+      bubbles[i].filled = random(0, 2);
     }
   }
 }
@@ -349,7 +341,6 @@ void drawBubbles(int digitsX, int digitsY, int digitsW, int digitsH) {
   if (config.disable_animation) return;
   for (int i = 0; i < MAX_BUBBLES; i++) {
     if (bubbles[i].active) {
-      // Проверяем пересечение с областью цифр
       bool intersects = (bubbles[i].x + bubbles[i].radius > digitsX && bubbles[i].x - bubbles[i].radius < digitsX + digitsW &&
                          bubbles[i].y + bubbles[i].radius > digitsY && bubbles[i].y - bubbles[i].radius < digitsY + digitsH);
       if (!intersects) {
@@ -363,13 +354,11 @@ void drawBubbles(int digitsX, int digitsY, int digitsW, int digitsH) {
   }
 }
 
-// ========== ОТРИСОВКА СОДЕРЖИМОГО ==========
 void updateDisplayContent() {
   if (!displayState) return;
 
   display.clearDisplay();
 
-  // Если нужно показать IP
   if (ipDisplayUntil > millis()) {
     display.setFont(NULL);
     display.setTextSize(1);
@@ -388,7 +377,6 @@ void updateDisplayContent() {
     return;
   }
 
-  // Определяем уровень CO2
   int levelIndex = 0;
   for (int i = 0; i < 4; i++) {
     if (currentPpm < config.thresholds[i]) {
@@ -398,14 +386,12 @@ void updateDisplayContent() {
     if (i == 3 && currentPpm >= config.thresholds[3]) levelIndex = 3;
   }
 
-  // Если отключено перемещение, фиксируем параметры
   if (config.disable_movement) {
     numberOffsetX = 0;
     numberOffsetY = 0;
-    levelNamePos = 0; // всегда слева внизу
+    levelNamePos = 0;
   }
 
-  // Рисуем CO₂
   display.setFont(NULL);
   display.setTextSize(config.font_scale_co2);
   char ppmStr[6];
@@ -422,11 +408,9 @@ void updateDisplayContent() {
   if (y < 0) y = 0;
   if (y + textHeight > SCREEN_HEIGHT) y = SCREEN_HEIGHT - textHeight;
 
-  // Обновляем и рисуем пузырьки, если анимация включена
   updateBubbles();
   drawBubbles(x, y, textWidth, textHeight);
 
-  // Рисуем цифры
   display.setTextColor(SSD1306_WHITE);
   if (currentPpm < 0) {
     display.setTextSize(1);
@@ -437,7 +421,6 @@ void updateDisplayContent() {
     display.print(ppmStr);
   }
 
-  // Рисуем уровень CO₂ (всегда слева внизу при отключённом перемещении)
   display.setTextSize(config.font_scale_info);
   int levelX, levelY = SCREEN_HEIGHT - 8 * config.font_scale_info;
   if (config.disable_movement || levelNamePos == 0) {
@@ -449,7 +432,6 @@ void updateDisplayContent() {
   display.setCursor(levelX, levelY);
   display.print(config.level_names[levelIndex]);
 
-  // Рисуем температуру (в правом верхнем углу)
   if (config.temp_enabled && currentTemp > -100.0 && currentTemp < 100.0) {
     display.setTextSize(config.font_scale_temp);
     char tempStr[10];
@@ -460,7 +442,6 @@ void updateDisplayContent() {
     display.print(tempStr);
   }
 
-  // Рисуем рамку, если не отключено перемещение
   if (!config.disable_movement) {
     display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
     if (levelIndex >= 2) {
@@ -514,14 +495,14 @@ void setupAP() {
     Serial.println("AP Started. IP: " + WiFi.softAPIP().toString());
     lastIP = WiFi.softAPIP().toString();
     apMode = true;
-    ipDisplayUntil = millis() + 5000; // показать IP на 5 секунд
+    ipDisplayUntil = millis() + 5000;
   } else {
     Serial.println("AP Failed!");
   }
 }
 
 void setupWiFi() {
-  if (apMode) return; // уже в режиме AP, не пытаемся подключиться
+  if (apMode) return;
 
   if (WiFi.status() == WL_CONNECTED) return;
   Serial.print("Connecting to WiFi");
@@ -539,7 +520,7 @@ void setupWiFi() {
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
     lastIP = WiFi.localIP().toString();
-    ipDisplayUntil = millis() + 5000; // показать IP на 5 секунд
+    ipDisplayUntil = millis() + 5000;
     apMode = false;
   } else {
     Serial.println(" Failed! Switching to AP mode.");
@@ -549,7 +530,7 @@ void setupWiFi() {
 
 // ========== MQTT ==========
 void reconnectMQTT() {
-  if (apMode) return; // в AP режиме MQTT не используем
+  if (apMode) return;
   while (!mqttClient.connected()) {
     Serial.print("Connecting to MQTT...");
     String clientId = "ESP32C3-" + String(random(0xffff), HEX);
@@ -574,7 +555,7 @@ void reconnectMQTT() {
 }
 
 void sendMqtt() {
-  if (apMode) return; // не отправляем в AP режиме
+  if (apMode) return;
   if (currentPpm > 0) {
     String payload = String(currentPpm);
     if (mqttClient.publish(config.mqtt_topic_co2, payload.c_str())) {
@@ -750,12 +731,11 @@ void handleRoot() {
 }
 
 void handleApiData() {
-  StaticJsonDocument<2048> doc;
+  JsonDocument doc;
   doc["current_co2"] = currentPpm;
   doc["current_temp"] = (config.temp_enabled && currentTemp > -100.0) ? currentTemp : (float)NULL;
-  JsonArray labels = doc.createNestedArray("labels");
-  JsonArray co2Arr = doc.createNestedArray("co2_values");
-  // Формируем метки времени (можно просто индексы)
+  JsonArray labels = doc["labels"].to<JsonArray>();
+  JsonArray co2Arr = doc["co2_values"].to<JsonArray>();
   for (int i = 0; i < historyCount; i++) {
     int idx = (historyIndex - historyCount + i + HISTORY_SIZE) % HISTORY_SIZE;
     labels.add(i + 1);
@@ -979,7 +959,6 @@ void handleConfig() {
     <form method="POST" action="/save">
 )rawliteral";
 
-  // ---- Wi-Fi ----
   html += R"rawliteral(
         <div class="tab-content active" id="wifi">
             <div class="section">
@@ -990,7 +969,6 @@ void handleConfig() {
         </div>
 )rawliteral";
 
-  // ---- MQTT ----
   html += R"rawliteral(
         <div class="tab-content" id="mqtt">
             <div class="section">
@@ -1005,7 +983,6 @@ void handleConfig() {
         </div>
 )rawliteral";
 
-  // ---- NTP ----
   html += R"rawliteral(
         <div class="tab-content" id="ntp">
             <div class="section">
@@ -1016,7 +993,6 @@ void handleConfig() {
         </div>
 )rawliteral";
 
-  // ---- Расписание ----
   html += R"rawliteral(
         <div class="tab-content" id="schedule">
             <div class="section">
@@ -1029,7 +1005,6 @@ void handleConfig() {
         </div>
 )rawliteral";
 
-  // ---- Кнопка ----
   String btnChecked = config.button_enabled ? "checked" : "";
   html += R"rawliteral(
         <div class="tab-content" id="button">
@@ -1043,7 +1018,6 @@ void handleConfig() {
         </div>
 )rawliteral";
 
-  // ---- CO₂ пороги ----
   html += R"rawliteral(
         <div class="tab-content" id="co2">
             <div class="section">
@@ -1060,7 +1034,6 @@ void handleConfig() {
         </div>
 )rawliteral";
 
-  // ---- Температура ----
   String tempChecked = config.temp_enabled ? "checked" : "";
   html += R"rawliteral(
         <div class="tab-content" id="temp">
@@ -1072,7 +1045,6 @@ void handleConfig() {
         </div>
 )rawliteral";
 
-  // ---- Дисплей ----
   html += R"rawliteral(
         <div class="tab-content" id="display">
             <div class="section">
@@ -1107,7 +1079,6 @@ void handleConfig() {
         </div>
 )rawliteral";
 
-  // ---- PIN и кнопка сохранения ----
   html += R"rawliteral(
         <div class="pin-group">
             <div class="form-group">
@@ -1151,13 +1122,11 @@ void handleConfig() {
 }
 
 void handleSave() {
-  // Проверка PIN
   if (!server.hasArg("pin") || server.arg("pin") != "0000") {
     server.send(403, "text/plain", "Неверный PIN-код");
     return;
   }
 
-  // Сохраняем настройки
   if (server.hasArg("ssid")) strlcpy(config.ssid, server.arg("ssid").c_str(), sizeof(config.ssid));
   if (server.hasArg("password")) strlcpy(config.password, server.arg("password").c_str(), sizeof(config.password));
   if (server.hasArg("mqtt_server")) strlcpy(config.mqtt_server, server.arg("mqtt_server").c_str(), sizeof(config.mqtt_server));
@@ -1212,11 +1181,11 @@ void setupWebServer() {
   Serial.println("HTTP server started");
 }
 
-// ========== КНОПКА (опрашиваем в loop) ==========
+// ========== КНОПКА ==========
 void handleButton() {
   if (!config.button_enabled) return;
 
-  bool pinState = digitalRead(config.button_gpio); // INPUT_PULLUP, LOW при нажатии
+  bool pinState = digitalRead(config.button_gpio);
   unsigned long now = millis();
 
   switch (btnState) {
@@ -1231,14 +1200,13 @@ void handleButton() {
     case BUTTON_PRESSED:
       if (pinState == HIGH) {
         if (!buttonLongPressHandled && (now - buttonPressTime) < LONG_PRESS_MS) {
-          // короткое нажатие
           buttonWakeUntil = now + config.button_wake_time * 1000UL;
           scheduleEnabled = false;
         }
         btnState = BUTTON_IDLE;
       } else if ((now - buttonPressTime) >= LONG_PRESS_MS && !buttonLongPressHandled) {
         buttonLongPressHandled = true;
-        buttonWakeUntil = now + 0xFFFFFFFF; // очень большое значение
+        buttonWakeUntil = now + 0xFFFFFFFF;
         scheduleEnabled = false;
         setDisplayPower(true);
       }
@@ -1259,7 +1227,6 @@ void setup() {
   delay(1000);
   Serial.println("CO2 Monitor v" + String(FW_VERSION));
 
-  // Инициализация дисплея
   I2Cbus.begin(I2C_SDA, I2C_SCL);
   I2Cbus.setClock(100000);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -1273,51 +1240,41 @@ void setup() {
   display.println("Loading...");
   display.display();
 
-  // Загрузка конфигурации
   loadConfig();
 
-  // Настройка датчика температуры
   if (config.temp_enabled) {
     oneWire = new OneWire(config.temp_gpio);
     sensors = new DallasTemperature(oneWire);
     sensors->begin();
   }
 
-  // Настройка пинов
   pinMode(PWM_PIN, INPUT);
   if (config.button_enabled) {
     pinMode(config.button_gpio, INPUT_PULLUP);
   }
 
-  // Wi-Fi (попытка подключиться к сохранённой сети, при неудаче - AP)
   setupWiFi();
 
-  // MQTT (если не в AP режиме)
   if (!apMode) {
     mqttClient.setServer(config.mqtt_server, config.mqtt_port);
   }
 
-  // NTP (только если не AP режим)
   if (!apMode) {
     timeClient.begin();
     timeClient.setTimeOffset(config.timezone * 3600);
     timeClient.update();
   }
 
-  // Анимация
   initBubbles();
   randomSeed(analogRead(0));
 
-  // История
   for (int i = 0; i < HISTORY_SIZE; i++) {
     co2History[i] = 0;
     tempHistory[i] = -127.0;
   }
 
-  // Веб-сервер
   setupWebServer();
 
-  // Экран по умолчанию включён
   setDisplayPower(true);
   updateDisplayContent();
 
@@ -1328,19 +1285,16 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Wi-Fi reconnect только если не в AP режиме
   if (!apMode && WiFi.status() != WL_CONNECTED) {
     setupWiFi();
   }
 
-  // MQTT reconnect & loop (только если не AP режим)
   if (!apMode) {
     if (!mqttClient.connected()) {
       reconnectMQTT();
     }
     mqttClient.loop();
 
-    // NTP update каждые 5 секунд (только если не AP)
     static unsigned long lastTimeUpdate = 0;
     if (now - lastTimeUpdate >= 5000) {
       lastTimeUpdate = now;
@@ -1348,7 +1302,6 @@ void loop() {
     }
   }
 
-  // Чтение PWM (CO2)
   int ppm = readCO2FromPWM(PWM_PIN);
   if (ppm > 0) {
     currentPpm = ppm;
@@ -1360,7 +1313,6 @@ void loop() {
     currentPpm = -1;
   }
 
-  // Чтение температуры
   if (now - lastTempRead >= TEMP_READ_INTERVAL) {
     lastTempRead = now;
     readTemperature();
@@ -1370,30 +1322,24 @@ void loop() {
     }
   }
 
-  // Добавление в историю
   if (now - lastHistoryAdd >= HISTORY_ADD_INTERVAL) {
     lastHistoryAdd = now;
     addToHistory(currentPpm, currentTemp);
   }
 
-  // Чередование позиции уровня CO2 (только если не отключено перемещение)
   if (!config.disable_movement && (now - lastLevelPosChange >= LEVEL_POS_INTERVAL)) {
     lastLevelPosChange = now;
     levelNamePos = (levelNamePos + 1) % 2;
   }
 
-  // Обработка кнопки
   handleButton();
 
-  // Управление экраном по расписанию/кнопке
   bool needOn = shouldDisplayOn();
   setDisplayPower(needOn);
 
-  // Обновление содержимого с анимацией
   if (now - lastUpdate >= UPDATE_INTERVAL) {
     lastUpdate = now;
     if (displayState) {
-      // Дрейф только если не отключено перемещение
       if (!config.disable_movement) {
         numberOffsetX = random(-3, 4);
         numberOffsetY = random(-3, 4);
@@ -1405,7 +1351,6 @@ void loop() {
     }
   }
 
-  // MQTT отправка раз в минуту (только если не AP)
   if (!apMode && (now - lastMqttSend >= MQTT_INTERVAL)) {
     lastMqttSend = now;
     if (currentPpm > 0 || (config.temp_enabled && currentTemp > -100.0 && currentTemp < 100.0)) {
